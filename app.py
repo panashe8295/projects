@@ -3,16 +3,20 @@ import numpy as np
 import pandas as pd
 import altair as alt
 import pydeck as pdk
+import requests  # for GeoJSON fetch
+
+import matplotlib
+matplotlib.use("Agg")  # headless backend (for Streamlit Cloud, servers, etc.)
 import matplotlib.pyplot as plt
+
 import streamlit as st
 import yfinance as yf
-from pathlib import Path
 from datetime import datetime
 
-st.set_page_config(page_title="Portfolio Lab — Table + Optimizer", layout="wide")
+
+st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 # ------------------ Config ------------------
-DATA_DIR = Path("Data")
 DEFAULT_TICKERS = ["SPY", "AMZN", "BABA", "AAPL", "MSFT", "NVDA"]
 DEFAULT_WEIGHTS = {"SPY": 0.10, "AMZN": -0.50, "BABA": 0.40}  # others default to 0.0
 COMMON_TICKERS = sorted(list(set(DEFAULT_TICKERS + """
@@ -20,44 +24,20 @@ AAPL MSFT NVDA META GOOGL AMZN TSLA JPM BAC WFC V MA KO PEP DIS INTC AMD NFLX XO
 BRK.B SPY QQQ IWM EFA EEM TLT GLD BABA BIDU TSM SAP SONY ASML NKE SBUX RTX GE BA
 """.split())))
 
-# ------------------ Helpers ------------------
-def load_adj_close_csv(fp: Path, label: str) -> pd.Series:
-    """Load Adj Close from a yfinance-style CSV with multiindex columns."""
-    df = pd.read_csv(fp, header=[0, 1], index_col=0, parse_dates=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        if "Adj Close" in df.columns.get_level_values(1):
-            s = df.xs("Adj Close", axis=1, level=1)
-            if isinstance(s, pd.DataFrame) and s.shape[1] == 1: s = s.iloc[:, 0]
-        elif "Adj Close" in df.columns.get_level_values(0):
-            s = df.xs("Adj Close", axis=1, level=0)
-            if isinstance(s, pd.DataFrame) and s.shape[1] == 1: s = s.iloc[:, 0]
-        else:
-            raise KeyError("'Adj Close' not found in multiindex columns")
-    else:
-        s = df["Adj Close"]
-    s.name = label
-    return s
-
-def try_load_ticker_local(ticker: str) -> pd.Series | None:
-    fp = DATA_DIR / f"{ticker}.csv"
-    if not fp.exists(): return None
-    try:
-        return load_adj_close_csv(fp, ticker)
-    except Exception:
-        return None
-
+# ------------------ Helpers (yfinance only) ------------------
 @st.cache_data(show_spinner=False, ttl=60*20)
-def fetch_history(tickers: list[str], period: str) -> pd.DataFrame:
-    """Fallback: fetch Adj Close via yfinance for any missing tickers."""
-    df = yf.Tickers(" ".join(tickers)).history(period=period, auto_adjust=False)
-    if df is None or df.empty:
+def fetch_history(tickers, period):
+    """Fetch Adj Close via yfinance for all tickers."""
+    data = yf.Tickers(" ".join(tickers)).history(period=period, auto_adjust=False)
+    if data is None or data.empty:
         return pd.DataFrame()
-    close_like = "Adj Close" if "Adj Close" in df.columns.get_level_values(0) else "Close"
-    data = df[close_like].copy()
-    data.columns = [c[1] if isinstance(c, tuple) else c for c in data.columns]  # flatten col names
-    return data
+    close_like = "Adj Close" if "Adj Close" in data.columns.get_level_values(0) else "Close"
+    df = data[close_like].copy()
+    # Flatten multiindex columns to ticker symbols
+    df.columns = [c[1] if isinstance(c, tuple) else c for c in df.columns]
+    return df
 
-def compute_indicators(prices: pd.Series, ma1=20, ma2=50, rsiw=14):
+def compute_indicators(prices, ma1=20, ma2=50, rsiw=14):
     s = prices.dropna()
     sma1 = s.rolling(ma1).mean()
     sma2 = s.rolling(ma2).mean()
@@ -70,7 +50,7 @@ def compute_indicators(prices: pd.Series, ma1=20, ma2=50, rsiw=14):
     rsi = 100 - (100 / (1 + rs))
     return sma1, sma2, rsi
 
-def random_optimize(returns: pd.DataFrame, objective: str, n_sims=20000, allow_short=True, seed=42):
+def random_optimize(returns, objective, n_sims=20000, allow_short=True, seed=42):
     rng = np.random.default_rng(seed)
     mu, cov = returns.mean(), returns.cov()
     n = len(mu)
@@ -83,15 +63,17 @@ def random_optimize(returns: pd.DataFrame, objective: str, n_sims=20000, allow_s
             w = rng.random(n); w = w / w.sum()
         pr = float(mu.values @ w)
         pv = float(np.sqrt(w @ cov.values @ w))
-        if pv == 0: continue
-        val = pr/pv if objective=="Sharpe" else (pr if objective=="Return" else pv)
-        if (objective in ("Sharpe","Return") and val > best_val) or (objective=="Volatility" and val < best_val):
+        if pv == 0:
+            continue
+        val = pr/pv if objective == "Sharpe" else (pr if objective == "Return" else pv)
+        if (objective in ("Sharpe","Return") and val > best_val) or (objective == "Volatility" and val < best_val):
             best_val, best_w = val, w
-    if best_w is None: best_w = np.ones(n)/n
+    if best_w is None:
+        best_w = np.ones(n) / n
     return pd.Series(best_w, index=mu.index)
 
 @st.cache_data(show_spinner=False, ttl=60*30)
-def load_fundamentals(tickers: list[str]) -> pd.DataFrame:
+def load_fundamentals(tickers):
     rows = []
     for t in tickers:
         try:
@@ -111,8 +93,7 @@ def load_fundamentals(tickers: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ------------------ UI: Header & controls ------------------
-st.title("Portfolio Lab — Table + Optimizer")
-st.caption("Reads local CSVs from `Data/` when available, otherwise fetches via yfinance.")
+st.title("Portfolio Dashboard")
 
 left, right = st.columns([1, 3])
 with left:
@@ -132,28 +113,14 @@ if not tickers:
     st.info("Pick at least one ticker to continue.")
     st.stop()
 
-# ------------------ Load prices: local first, then fetch missing ------------------
-series = []
-missing = []
-for t in tickers:
-    s = try_load_ticker_local(t)
-    if s is not None:
-        series.append(s)
-    else:
-        missing.append(t)
-
-if missing:
-    fetched = fetch_history(missing, period)
-    for t in missing:
-        if t in fetched.columns:
-            series.append(fetched[t].rename(t))
-
-if not series:
-    st.error("No data found (local CSVs missing and yfinance returned empty).")
+# ------------------ Load prices from yfinance ------------------
+prices = fetch_history(tickers, period)
+if prices.empty:
+    st.error("No data returned by yfinance for the selected tickers/period.")
     st.stop()
 
-prices = pd.concat(series, axis=1).dropna(how="all").ffill().dropna().sort_index()
-# Align to selected tickers (drop any with empty data)
+prices = prices.dropna(how="all").ffill().dropna().sort_index()
+# Keep only requested tickers that actually returned data
 prices = prices[[c for c in tickers if c in prices.columns]]
 if prices.empty:
     st.error("No overlapping data across selected tickers.")
@@ -227,15 +194,58 @@ if force_sum and weights.sum() != 0:
 # Persist new weights into session state so they survive reruns
 st.session_state.weights.update({t: float(weights[t]) for t in weights.index})
 
-# ------------------ Portfolio series & stats ------------------
-port_ret_series = returns @ weights
+# ------------------ Portfolio series & stats (robust) ------------------
+# Recompute from final weights
+port_ret_series = returns[weights.index] @ weights
 port_curve = (1.0 + port_ret_series).cumprod()
 port_curve.name = "Portfolio"
-port_mu = float(port_ret_series.mean())
-port_sigma = float(port_ret_series.std())
-port_sharpe = (port_mu / port_sigma) if port_sigma != 0 else np.nan
+
+# Daily stats
+port_mu_daily = float(port_ret_series.mean())
+port_sigma_daily = float(port_ret_series.std())
+port_sharpe_daily = (port_mu_daily / port_sigma_daily) if port_sigma_daily != 0 else None
 port_cumret = float(port_curve.iloc[-1] - 1.0)
 w_sum = float(weights.sum())
+
+# Optional annualization
+st.subheader("Final statistics")
+annualize = st.checkbox("Show annualized figures (252 trading days)", value=False)
+if annualize:
+    ann_factor = np.sqrt(252)
+    port_mu = port_mu_daily * 252.0
+    port_sigma = port_sigma_daily * ann_factor
+    port_sharpe = (port_mu / port_sigma) if port_sigma != 0 else None
+    mean_label = "Mean (annualized)"
+    vol_label = "Volatility (annualized)"
+    sharpe_label = "Sharpe (annualized)"
+else:
+    port_mu = port_mu_daily
+    port_sigma = port_sigma_daily
+    port_sharpe = port_sharpe_daily
+    mean_label = "Mean (daily μ)"
+    vol_label = "Volatility (daily σ)"
+    sharpe_label = "Sharpe (μ/σ)"
+
+# Display stats in same font (table)
+port_df = pd.DataFrame([{
+    "Cumulative Return": port_cumret,
+    mean_label: port_mu,
+    vol_label: port_sigma,
+    sharpe_label: (None if port_sharpe is None or not np.isfinite(port_sharpe) else float(port_sharpe)),
+    "Sum of Weights": w_sum,
+}])
+st.dataframe(
+    port_df,
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Cumulative Return": st.column_config.NumberColumn(format="%.2f%%"),
+        mean_label:         st.column_config.NumberColumn(format="%.6f"),
+        vol_label:          st.column_config.NumberColumn(format="%.6f"),
+        sharpe_label:       st.column_config.NumberColumn(format="%.2f"),
+        "Sum of Weights":   st.column_config.NumberColumn(format="%.4f"),
+    },
+)
 
 # ------------------ Main chart: normalized + portfolio ------------------
 st.subheader("Performance (normalized to 1.0)")
@@ -249,28 +259,10 @@ ax.grid(True, alpha=0.3)
 ax.legend()
 st.pyplot(fig)
 
-# ------------------ Portfolio final stats (table: same font) ------------------
-st.subheader("Portfolio — Final Stats")
-port_df = pd.DataFrame([{
-    "Cumulative Return": port_cumret,
-    "Mean (daily μ)": port_mu,
-    "Volatility (daily σ)": port_sigma,
-    "Sharpe (μ/σ)": port_sharpe,
-    "Sum of Weights": w_sum,
-}])
-st.dataframe(
-    port_df.style.format({
-        "Cumulative Return": "{:.2%}",
-        "Mean (daily μ)": "{:.6f}",
-        "Volatility (daily σ)": "{:.6f}",
-        "Sharpe (μ/σ)": "{:.2f}",
-        "Sum of Weights": "{:.4f}",
-    }),
-    hide_index=True,
-    use_container_width=True
-)
+# ------------------ Preload fundamentals once ------------------
+fundamentals_all = load_fundamentals(list(prices.columns))
 
-# ------------------ Tabs: Indicators • Scatter • Fundamentals & Commentary • Map ------------------
+# ------------------ Tabs ------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Indicators", "Risk/Return", "Fundamentals & Commentary", "World Footprint"])
 
 with tab1:
@@ -300,7 +292,7 @@ with tab1:
 
 with tab2:
     st.subheader("Risk/Return scatter & random frontier cloud")
-    mu, vol, cov = returns.mean(), returns.std(), returns.cov()
+    mu2, vol2, cov2 = returns.mean(), returns.std(), returns.cov()
     cloudN = st.slider("Cloud size", 1000, 10000, 4000, 500, key="cloudN")
     allow_short_cloud = st.checkbox("Allow shorting (cloud)", value=True, key="cloudShort")
     rng = np.random.default_rng(7)
@@ -312,12 +304,12 @@ with tab2:
             w = rng.normal(0, 1, size=n); s = w.sum(); w = (w/s) if s != 0 else w
         else:
             w = rng.random(n); w = w / w.sum()
-        r = float(mu.values @ w)
-        v = float(np.sqrt(w @ cov.values @ w))
+        r = float(mu2.values @ w)
+        v = float(np.sqrt(w @ cov2.values @ w))
         pts.append({"Vol": v, "Ret": r})
     df_cloud = pd.DataFrame(pts)
-    df_assets = pd.DataFrame({"Ticker": cols, "Vol": vol.values, "Ret": mu.values})
-    df_port = pd.DataFrame([{"Item":"Portfolio","Vol": port_sigma, "Ret": port_mu}])
+    df_assets = pd.DataFrame({"Ticker": cols, "Vol": vol2.values, "Ret": mu2.values})
+    df_port = pd.DataFrame([{"Item":"Portfolio","Vol": float(port_sigma_daily), "Ret": float(port_mu_daily)}])
 
     ch_cloud = alt.Chart(df_cloud).mark_point(opacity=0.18).encode(x="Vol:Q", y="Ret:Q")
     ch_assets = alt.Chart(df_assets).mark_point(size=80, color="black").encode(
@@ -327,57 +319,177 @@ with tab2:
 
 with tab3:
     st.subheader("Fundamentals (best-effort)")
-    fundamentals = load_fundamentals(list(prices.columns))
-    st.dataframe(fundamentals, use_container_width=True)
+    st.dataframe(fundamentals_all, use_container_width=True)
 
     st.subheader("AI-style commentary")
     w_long = weights[weights > 0].sum()
     w_short = -weights[weights < 0].sum()
     skew = "balanced" if abs(w_long - w_short) < 0.2 else ("long-biased" if w_long > w_short else "short-biased")
-    risk_bar = returns.std().mean()
-    risk_level = "low" if port_sigma < risk_bar/2 else "moderate" if port_sigma < risk_bar else "elevated"
     tilt = "defensive" if w_short > 0.3 else "growth-tilted" if w_long > 0.7 else "mixed"
     st.write(
         f"Your allocation looks **{skew}** and **{tilt}**. On this dataset, daily μ = **{port_mu:.4f}**, "
-        f"σ = **{port_sigma:.4f}**, Sharpe = **{(port_sharpe if np.isfinite(port_sharpe) else float('nan')):.2f}**. "
+        f"σ = **{port_sigma:.4f}**, Sharpe = **{(port_sharpe if (port_sharpe is not None and np.isfinite(port_sharpe)) else float('nan')):.2f}**. "
         f"Consider adding low-correlation assets to stabilize variance and watching concentration risk."
     )
 
 with tab4:
-    st.subheader("World footprint (issuer country; bubble ∝ long weight)")
-    df_f = fundamentals[["Ticker","Country"]].copy()
-    df_f["Weight"] = df_f["Ticker"].map(weights.to_dict()).fillna(0.0)
-    df_f["LongWeight"] = df_f["Weight"].clip(lower=0.0)
+    st.subheader("World footprint")
 
-    # Quick country -> lat/lon mapping (coarse, for demo)
-    COUNTRY_LL = {
-        "United States": (39.8, -98.6), "China": (35.0, 103.8), "Taiwan": (23.7, 121.0), "Japan": (36.2, 138.3),
-        "United Kingdom": (55.0, -3.4), "Germany": (51.2, 10.4), "France": (46.2, 2.2), "Canada": (56.1,-106.3),
-        "South Korea": (36.5, 128.0), "India": (21.1, 78.0), "Brazil": (-14.2, -51.9), "Australia": (-25.3, 133.8),
-        "Netherlands": (52.1, 5.3), "Switzerland": (46.8, 8.2), "Spain": (40.4, -3.7), "Italy": (41.9, 12.6),
-        "Sweden": (60.1, 18.6), "Ireland": (53.1, -8.2), "Israel": (31.0, 35.0), "Mexico": (23.6, -102.5),
-        "Singapore": (1.35, 103.8), "Hong Kong": (22.3, 114.2)
+    # --- Fundamentals → issuer country (with overrides for some tickers) ---
+    df_f = fundamentals_all[["Ticker", "Country"]].copy()
+
+    ISSUER_COUNTRY_OVERRIDE = {
+        "BABA": "China",
+        "AMZN": "United States",
+        "AAPL": "United States",
+        "MSFT": "United States",
+        "NVDA": "United States",
+        "SPY": "United States",  # ETF simplification
+        "TSM": "Taiwan",
+        "BIDU": "China",
+        "TSLA": "United States",
+        "META": "United States",
+        "GOOGL": "United States",
     }
-    df_f["lat"] = df_f["Country"].map(lambda c: COUNTRY_LL.get(c, (0.0,0.0))[0])
-    df_f["lon"] = df_f["Country"].map(lambda c: COUNTRY_LL.get(c, (0.0,0.0))[1])
-    st.dataframe(df_f.fillna(""), use_container_width=True)
-
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=df_f.dropna(subset=["lat","lon"]),
-        get_position="[lon, lat]",
-        get_radius="1000000 * LongWeight + 200000",
-        pickable=True,
+    df_f["Country"] = df_f.apply(
+        lambda r: ISSUER_COUNTRY_OVERRIDE.get(str(r["Ticker"]).upper(), r["Country"]),
+        axis=1
     )
-    view_state = pdk.ViewState(latitude=20, longitude=0, zoom=1.2)
-    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state,
-                             tooltip={"text":"{Ticker}\n{Country}\nweight: {Weight}"}))
+    df_f = df_f.dropna(subset=["Country"]).copy()
 
-# --------------- Raw data peek ---------------
-with st.expander("Show raw data (tail)"):
-    st.write("**Prices:**")
-    st.dataframe(prices.tail(), use_container_width=True)
-    st.write("**Daily Returns:**")
-    st.dataframe(returns.tail(), use_container_width=True)
+    # Presence by country (one color per country if any ticker from that country)
+    country_tickers = (
+        df_f.groupby("Country")["Ticker"]
+        .apply(lambda s: sorted(set(s.astype(str))))
+        .to_dict()
+    )
+    active_countries = list(country_tickers.keys())
 
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • Weights persist during this session")
+    if not active_countries:
+        st.info("No country data available from yfinance fundamentals.")
+    else:
+        # Map fundamentals names -> GeoJSON names
+        COUNTRY_NAME_FIX = {
+            "United States": "United States of America",
+            "South Korea": "Republic of Korea",
+            "Russia": "Russian Federation",
+            "Iran": "Iran (Islamic Republic of)",
+            "Syria": "Syrian Arab Republic",
+            "Viet Nam": "Vietnam",
+            "Czech Republic": "Czechia",
+            "Ivory Coast": "Côte d'Ivoire",
+            "Congo (Kinshasa)": "Democratic Republic of the Congo",
+            "Congo (Brazzaville)": "Congo",
+            "Venezuela": "Venezuela (Bolivarian Republic of)",
+            "Tanzania": "United Republic of Tanzania",
+            "Laos": "Lao People's Democratic Republic",
+            "Bolivia": "Bolivia (Plurinational State of)",
+            "Brunei": "Brunei Darussalam",
+            "South Sudan": "South Sudan",
+            "Hong Kong": "Hong Kong",
+        }
+        rev_fix = {}
+        for f_name, g_name in COUNTRY_NAME_FIX.items():
+            rev_fix.setdefault(g_name, []).append(f_name)
+
+        # Load world GeoJSON polygons
+        url = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json"
+        try:
+            gj = requests.get(url, timeout=20).json()
+        except Exception:
+            gj = None
+            st.error("Could not load world polygons for the map.")
+
+        if gj:
+            # Color palette & mapping (one color per active country)
+            palette_rgb = [
+                (220,  20,  60),   # red
+                ( 30, 144, 255),   # blue
+                (255, 140,   0),   # orange
+                ( 34, 139,  34),   # green
+                (138,  43, 226),   # purple
+                (  0, 206, 209),   # teal
+                (255, 105, 180),   # pink
+                (205, 133,  63),   # brown
+                (255, 215,   0),   # gold
+                ( 70, 130, 180),   # steel
+            ]
+            color_map = {c: palette_rgb[i % len(palette_rgb)] for i, c in enumerate(active_countries)}
+
+            # Enrich GeoJSON features with fill/line color and tickers
+            for f in gj.get("features", []):
+                name = f.get("properties", {}).get("name", "")
+                fundamentals_name = None
+
+                if name in active_countries:
+                    fundamentals_name = name
+                elif name in rev_fix:
+                    for cand in rev_fix[name]:
+                        if cand in active_countries:
+                            fundamentals_name = cand
+                            break
+
+                if fundamentals_name:
+                    r, g, b = color_map[fundamentals_name]
+                    fill = [r, g, b, 220]             # colored country (opaque-ish)
+                    line = [255, 255, 255, 200]       # bright border
+                    tickers_here = ", ".join(country_tickers[fundamentals_name])
+                else:
+                    # Darker grey for non-active countries
+                    fill = [20, 20, 20, 230]
+                    line = [60, 60, 60, 200]
+                    tickers_here = ""
+
+                props = f.setdefault("properties", {})
+                props["fill_color"] = fill
+                props["line_color"] = line
+                props["tickers"] = tickers_here
+
+            layer = pdk.Layer(
+                "GeoJsonLayer",
+                gj,
+                stroked=True,
+                filled=True,
+                get_fill_color="properties.fill_color",
+                get_line_color="properties.line_color",
+                get_line_width=1.2,
+                pickable=True,
+            )
+
+            view_state = pdk.ViewState(latitude=20, longitude=0, zoom=1.2)
+            deck = pdk.Deck(
+                layers=[layer],
+                initial_view_state=view_state,
+                map_style="mapbox://styles/mapbox/dark-v11",  # darker basemap
+                tooltip={"text": "{name}\nTickers: {tickers}"}
+            )
+            st.pydeck_chart(deck)
+
+            # Legend: country → color
+            st.markdown("**Map legend (country → color)**")
+            legend_bits = []
+            for c in active_countries:
+                r, g, b = color_map[c]
+                bit = f"""
+                <span style="display:inline-block;margin:4px 12px 6px 0;">
+                  <span style="display:inline-block;width:12px;height:12px;background:rgb({r},{g},{b});border-radius:2px;margin-right:6px;"></span>
+                  {c}
+                </span>
+                """
+                legend_bits.append(bit)
+            st.markdown("".join(legend_bits), unsafe_allow_html=True)
+
+            with st.expander("Show country → tickers"):
+                show_rows = []
+                for c in sorted(active_countries):
+                    for t in country_tickers[c]:
+                        show_rows.append({"Country": c, "Ticker": t})
+                st.dataframe(pd.DataFrame(show_rows), use_container_width=True)
+
+# --------------- Last 10 days of normalized data ---------------
+st.subheader("Last 10 trading days — Normalized prices (start = 1.0)")
+last10 = norm.tail(10).copy()
+last10.index = last10.index.strftime("%Y-%m-%d")
+st.dataframe(last10.round(4), use_container_width=True)
+
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • Data via yfinance • Weights persist during this session")
